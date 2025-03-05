@@ -1,0 +1,158 @@
+name: Test Fork CI
+
+permissions: write-all
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref_name:
+        description: "Branch or tag to use (e.g., network-operator-test)"
+        required: true
+      ref_type:
+        description: "Type of ref to use (tag or branch)"
+        required: true
+      distinct_id:
+        description: "Unique identifier for the run"
+
+jobs:
+  # this job is needed for the parent job to de able to detect workflow run id and later its status
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: echo distinct ID ${{ inputs.distinct_id }}
+        run: echo ${{ inputs.distinct_id }}
+
+  create-test-environment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - if: inputs.ref_type == 'tag'
+        name: Create release tag and branch
+        run: |
+          release_branch=$(echo ${{ inputs.ref_name }} | sed -E 's/^network-operator-([0-9]+\.[0-9]+).+/v\1.x/')  # example: transforms "network-operator-25.1.0-beta.2" to "v25.1.x"
+          git checkout -b $release_branch
+          git push origin $release_branch -f
+          git tag ${{ inputs.ref_name }}
+          git push origin ${{ inputs.ref_name }} -f
+          echo BRANCH=$release_branch | tee -a $GITHUB_ENV
+          echo TAG=${{ inputs.ref_name }} | tee -a $GITHUB_ENV
+      - if: inputs.ref_type == 'branch'
+        name: Create release branch
+        run: |
+          git checkout -b ${{ inputs.ref_name }}
+          git push origin ${{ inputs.ref_name }} -f
+          echo BRANCH=${{ inputs.ref_name }} | tee -a $GITHUB_ENV
+      - name: Store branch and tag
+        id: store-tag-branch
+        run: |
+          echo BRANCH=$BRANCH >> $GITHUB_OUTPUT
+          echo TAG=$TAG >> $GITHUB_OUTPUT
+    outputs:
+      branch: ${{ steps.store-tag-branch.outputs.BRANCH }}
+      tag: ${{ steps.store-tag-branch.outputs.TAG }}
+
+  call-reusable-ci-fork-workflow:
+    needs: create-test-environment
+    uses: almaslennikov/reusable-release-workflows/.github/workflows/ci-fork.yml@dev
+    with:
+      registry-internal: ghcr.io/almaslennikov
+      registry-public: ghcr.io/almaslennikov
+      service-account-username: almaslennikov
+      service-account-email: almaslennikov@nvidia.com
+      components: '[{"name": "TestingComponent", "imageName": "reusable-release-workflows-testing", "Dockerfile": "Dockerfile.test"},
+      {"name": "AnotherTestingComponent", "imageName": "another-reusable-release-workflows-testing", "Dockerfile": "Dockerfile.another-test"}]'
+      ref-name: ${{ inputs.ref_name }}
+      ref-type: ${{ inputs.ref_type }}
+      network-operator-repo: reusable-release-workflows-testing
+    secrets:
+      registry-username: ${{ github.repository_owner }}
+      registry-token: ${{ secrets.GITHUB_TOKEN }}
+      cicd-gh-token: ${{ secrets.CICD_TOKEN }}
+
+  validate-pr-with-updated-version-open:
+    needs: call-reusable-ci-fork-workflow
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate that a PR with updated versions was opened
+        id: validate_pr_open
+        run: |
+          OUTPUT=$(gh pr list --repo ${{ github.repository }} --search="state:open in:title ${{ needs.call-reusable-ci-fork-workflow.outputs.docker-tag }}" --json headRefName)
+
+          # Validate that the output contains exactly one element
+          if [ "$(echo "$OUTPUT" | jq 'length')" -eq 1 ]; then
+          HEAD_REF_NAME=$(echo "$OUTPUT" | jq -r '.[0].headRefName')
+          echo "head_ref_name=$HEAD_REF_NAME" >> $GITHUB_OUTPUT
+          else
+          echo "Error: Output does not contain exactly 1 element." >&2
+          exit 1
+          fi
+        shell: bash
+    outputs:
+      head-ref-name: ${{ steps.validate_pr_open.outputs.HEAD_REF_NAME }}
+
+  validate-pr-changes:
+    needs:
+      - call-reusable-ci-fork-workflow
+      - validate-pr-with-updated-version-open
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate-pr-with-updated-version-open.outputs.head-ref-name }}
+      - name: Verify version changes in PR
+        env:
+          DOCKER_TAG: ${{ needs.call-reusable-ci-fork-workflow.outputs.docker-tag }}
+          # TODO make react on public and internal registries if needed
+          DOCKER_REGISTRY: ghcr.io/almaslennikov
+          COMPONENT: TestingComponent
+        run: |
+          make release-build
+
+  cleanup:
+    if: always()
+    env:
+      GH_TOKEN: ${{ github.token }}
+    needs:
+      - create-test-environment
+      - validate-pr-with-updated-version-open
+      - validate-pr-changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delete all tags and branches that might have been created in the repo
+        env:
+          BRANCH: ${{ needs.create-test-environment.outputs.branch }}
+          TAG: ${{ needs.create-test-environment.outputs.tag }}
+        run: |
+          # for branch in $(git ls-remote --heads origin | awk '{print $2}' | sed 's#refs/heads/##' | grep -E '^(v[0-9]+\.[0-9]+\.x|.*network-operator-.*)$'); do
+          #   # Check if a PR exists for this branch
+          #   PR_NUMBER=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number')
+          #   if [ -n "$PR_NUMBER" ]; then
+          #     echo "Closing PR #$PR_NUMBER for branch $branch..."
+          #     gh pr close "$PR_NUMBER"
+          #   fi
+          #   # Now delete the branch
+          #   echo "Deleting branch $branch from origin..."
+          #   git push origin --delete "$branch"
+          # done
+          # git ls-remote --tags origin | awk '{print $2}' | sed 's#refs/tags/##' | grep -E '^(v[0-9]+\.[0-9]+\.x|.*network-operator-.*)$' | xargs -I {} git push origin --delete refs/tags/{}
+
+          if $BRANCH != ""; then
+            # Check if a PR exists for this branch
+            PR_NUMBER=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number')
+
+            if [ -n "$PR_NUMBER" ]; then
+              echo "Closing PR #$PR_NUMBER for branch $BRANCH..."
+              gh pr close "$PR_NUMBER"
+            fi
+
+            # Now delete the branch
+            echo "Deleting branch $BRANCH from origin..."
+            git push origin --delete "$BRANCH"
+          fi
+
+          if $TAG != ""; then
+            git push origin --delete refs/tags/$TAG
+          fi
