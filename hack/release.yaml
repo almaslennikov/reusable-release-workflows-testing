@@ -1,0 +1,8 @@
+TestingComponent:
+  image: reusable-release-workflows-testing
+  repository: test-repo
+  version: test-tag
+AnotherTestingComponent:
+  image: another-reusable-release-workflows-testing
+  repository: test-repo
+  version: test-tag
