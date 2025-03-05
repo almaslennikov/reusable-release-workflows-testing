@@ -1,0 +1,181 @@
+name: Test Fork CI
+
+permissions: write-all
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref_name:
+        description: "Branch or tag to use (e.g., network-operator-test)"
+        required: true
+      ref_type:
+        description: "Type of ref to use (tag or branch)"
+        required: true
+      distinct_id:
+        description: "Unique identifier for the run"
+
+jobs:
+  # this job is needed for the parent job to de able to detect workflow run id and later its status
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: echo distinct ID ${{ inputs.distinct_id }}
+        run: echo ${{ inputs.distinct_id }}
+
+  create-test-environment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - if: inputs.ref_type == 'tag'
+        name: Create release tag and branch
+        run: |
+          release_branch=$(echo ${{ inputs.ref_name }} | sed -E 's/^network-operator-([0-9]+\.[0-9]+).+/v\1.x/')  # example: transforms "network-operator-25.1.0-beta.2" to "v25.1.x"
+          git checkout -b $release_branch
+          git push origin $release_branch -f
+          git tag ${{ inputs.ref_name }}
+          git push origin ${{ inputs.ref_name }} -f
+          echo BRANCH=$release_branch | tee -a $GITHUB_ENV
+          echo TAG=${{ inputs.ref_name }} | tee -a $GITHUB_ENV
+      - if: inputs.ref_type == 'branch'
+        name: Create release branch
+        run: |
+          git checkout -b ${{ inputs.ref_name }}
+          git push origin ${{ inputs.ref_name }} -f
+          echo BRANCH=${{ inputs.ref_name }} | tee -a $GITHUB_ENV
+      - name: Store branch and tag
+        id: store-tag-branch
+        run: |
+          echo BRANCH=$BRANCH >> $GITHUB_OUTPUT
+          echo TAG=$TAG >> $GITHUB_OUTPUT
+    outputs:
+      branch: ${{ steps.store-tag-branch.outputs.BRANCH }}
+      tag: ${{ steps.store-tag-branch.outputs.TAG }}
+
+  call-reusable-ci-fork-workflow:
+    needs: create-test-environment
+    uses: almaslennikov/reusable-release-workflows/.github/workflows/ci-fork.yml@dev
+    with:
+      registry-internal: ghcr.io/almaslennikov
+      registry-public: ghcr.io/almaslennikov
+      service-account-username: almaslennikov
+      service-account-email: almaslennikov@nvidia.com
+      components: '[{"name": "TestingComponent", "imageName": "reusable-release-workflows-testing", "Dockerfile": "Dockerfile.test"},
+      {"name": "AnotherTestingComponent", "imageName": "another-reusable-release-workflows-testing", "Dockerfile": "Dockerfile.another-test"}]'
+      chart-name: test-chart
+      chart-path: "charts-to-test/test-chart"
+      exclude-chart-files: '["existing-file-to-exclude", "new-file-to-exclude"]'
+      ref-name: ${{ inputs.ref_name }}
+      ref-type: ${{ inputs.ref_type }}
+      network-operator-repo: reusable-release-workflows-testing
+    secrets:
+      registry-username: ${{ github.repository_owner }}
+      registry-token: ${{ secrets.GITHUB_TOKEN }}
+      cicd-gh-token: ${{ secrets.CICD_TOKEN }}
+
+  # TODO test that image was made with a new DOCKER_TAG from a specific branch
+  validate-pr-with-updated-version-open:
+    needs: call-reusable-ci-fork-workflow
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate that a PR with updated versions was opened
+        id: validate_pr_open
+        run: |
+          OUTPUT=$(gh pr list --repo ${{ github.repository }} --search="state:open in:title ${{ needs.call-reusable-ci-fork-workflow.outputs.docker-tag }}" --json headRefName,number)
+
+          # Validate that the output contains exactly one element
+          if [ "$(echo "$OUTPUT" | jq 'length')" -eq 1 ]; then
+            HEAD_REF_NAME=$(echo "$OUTPUT" | jq -r '.[0].headRefName')
+            PR_NUMBER=$(echo "$OUTPUT" | jq -r '.[0].number')
+            echo "head_ref_name=$HEAD_REF_NAME" >> $GITHUB_OUTPUT
+            echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          else
+            echo "Error: Output does not contain exactly 1 element." >&2
+            exit 1
+          fi
+        shell: bash
+    outputs:
+      head-ref-name: ${{ steps.validate_pr_open.outputs.HEAD_REF_NAME }}
+      pr-number: ${{ steps.validate_pr_open.outputs.PR_NUMBER }}
+
+  validate-pr-changes:
+    needs:
+      - call-reusable-ci-fork-workflow
+      - validate-pr-with-updated-version-open
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate-pr-with-updated-version-open.outputs.head-ref-name }}
+      - name: Verify version changes in PR
+        env:
+          DOCKER_TAG: ${{ needs.call-reusable-ci-fork-workflow.outputs.docker-tag }}
+          # TODO make react on public and internal registries if needed
+          DOCKER_REGISTRY: ghcr.io/almaslennikov
+        run: |
+          make release-build
+
+          # TODO validate that the docker image was built from the requested branch
+
+          PATH_TO_CHART="deployment/network-operator/charts/test-chart"
+
+          ls $PATH_TO_CHART
+
+          if [[ -f "$PATH_TO_CHART/new-file-to-exclude" ]]; then
+            echo "Error: new-file-to-exclude should not have been copied to network-operator" >&2
+            exit 1
+          fi
+
+          if [[ ! -f "$PATH_TO_CHART/new-file-to-add" ]]; then
+            echo "Error: new-file-to-add should have been copied to network-operator" >&2
+            exit 1
+          fi
+
+          if ! grep -Fxq "old content" $PATH_TO_CHART/existing-file-to-exclude; then
+            echo "Error: existing-file-to-exclude should not have been updated in the network-operator" >&2
+            exit 1
+          fi
+
+          if ! grep -Fxq "new content" $PATH_TO_CHART/folder/existing-file-to-change; then
+            echo "Error: existing-file-to-change should have been updated in the network-operator" >&2
+            exit 1
+          fi
+
+  cleanup:
+    if: always()
+    env:
+      GH_TOKEN: ${{ github.token }}
+    needs:
+      - create-test-environment
+      - validate-pr-with-updated-version-open
+      - validate-pr-changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delete all tags and branches that might have been created in the repo
+        env:
+          BRANCH: ${{ needs.create-test-environment.outputs.branch }}
+          TAG: ${{ needs.create-test-environment.outputs.tag }}
+          PR_BRANCH: ${{ needs.validate-pr-with-updated-version-open.outputs.head-ref-name }}
+          PR_NUMBER: ${{ needs.validate-pr-with-updated-version-open.outputs.pr-number }}
+        run: |
+          if [ -n "$PR_NUMBER" ]; then
+            echo "Closing PR #$PR_NUMBER..."
+            gh pr close "$PR_NUMBER"
+          fi
+
+          if [ -n "$PR_BRANCH" ]; then
+          echo "Deleting pr branch $PR_BRANCH from origin..."
+          git push origin --delete "$PR_BRANCH"
+          fi
+
+          if [ -n "$BRANCH" ]; then
+            echo "Deleting branch $BRANCH from origin..."
+            git push origin --delete "$BRANCH"
+          fi
+
+          if [ -n "$TAG" ]; then
+            echo "Deleting tag $TAG from origin..."
+            git push origin --delete refs/tags/$TAG
+          fi
