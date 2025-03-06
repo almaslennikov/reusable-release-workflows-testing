@@ -1,4 +1,7 @@
 TestingComponent:
   image: reusable-release-workflows-testing
-  repository: test-repo
-  version: test-tag
+  repository: ghcr.io/almaslennikov
+  version: 7f7d646
+AnotherTestingComponent:
+  repository: ghcr.io/almaslennikov
+  version: 7f7d646
