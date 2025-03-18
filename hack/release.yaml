@@ -1,8 +1,8 @@
 TestingComponent:
   image: reusable-release-workflows-testing
-  repository: test-repo
-  version: test-tag
+  repository: ghcr.io/almaslennikov
+  version: network-operator-22.2-rc.1
 AnotherTestingComponent:
   image: another-reusable-release-workflows-testing
-  repository: test-repo
-  version: test-tag
+  repository: ghcr.io/almaslennikov
+  version: network-operator-22.2-rc.1
