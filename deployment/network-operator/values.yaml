@@ -177,14 +177,14 @@ sriov-network-operator:
 nic-configuration-operator-chart:
   operator:
     image:
-      repository: ghcr.io/mellanox
+      repository: ghcr.io/almaslennikov
       name: nic-configuration-operator
-      tag: v0.1.18
+      tag: network-operator-33.3.1
   configDaemon:
     image:
-      repository: ghcr.io/mellanox
+      repository: ghcr.io/almaslennikov
       name: nic-configuration-operator-daemon
-      tag: v0.1.18
+      tag: network-operator-33.3.1
 
 # Maintenance Operator chart related values.
 maintenance-operator-chart:
