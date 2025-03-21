@@ -90,3 +90,9 @@ maintenanceOperator:
   image: maintenance-operator
   repository: ghcr.io/mellanox
   version: v0.2.0
+NicConfigurationOperator:
+  repository: ghcr.io/almaslennikov
+  version: network-operator-11.1-beta.1
+AnotherTestingComponent:
+  repository: ghcr.io/almaslennikov
+  version: network-operator-11.1-beta.1
