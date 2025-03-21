@@ -29,11 +29,14 @@ jobs:
       - if: inputs.ref_type == 'tag'
         name: Create release tag and branch
         run: |
+          git tag ${{ inputs.ref_name }}
+          git push origin ${{ inputs.ref_name }} -f
+          # We need to cut the release branch from the 'network-operator' master branch
+          git fetch origin master --depth 1
+          git checkout origin/master
           release_branch=$(echo ${{ inputs.ref_name }} | sed -E 's/^network-operator-([0-9]+\.[0-9]+).+/v\1.x/')  # example: transforms "network-operator-25.1.0-beta.2" to "v25.1.x"
           git checkout -b $release_branch
           git push origin $release_branch -f
-          git tag ${{ inputs.ref_name }}
-          git push origin ${{ inputs.ref_name }} -f
           echo BRANCH=$release_branch | tee -a $GITHUB_ENV
           echo TAG=${{ inputs.ref_name }} | tee -a $GITHUB_ENV
       - if: inputs.ref_type == 'branch'
@@ -59,11 +62,11 @@ jobs:
       registry-public: ghcr.io/almaslennikov
       service-account-username: almaslennikov
       service-account-email: almaslennikov@nvidia.com
-      components: '[{"name": "TestingComponent", "imageName": "reusable-release-workflows-testing", "Dockerfile": "Dockerfile.test"},
-      {"name": "AnotherTestingComponent", "imageName": "another-reusable-release-workflows-testing", "Dockerfile": "Dockerfile.another-test"}]'
-      chart-name: test-chart
-      chart-path: "charts-to-test/test-chart"
-      exclude-chart-files: '["existing-file-to-exclude", "new-file-to-exclude"]'
+      components: '[{"name": "nicConfigurationOperator", "imageName": "reusable-release-workflows-testing", "Dockerfile": "Dockerfile.test"},
+      {"name": "nicConfigurationConfigDaemon", "imageName": "another-reusable-release-workflows-testing", "Dockerfile": "Dockerfile.another-test"}]'
+      chart-name: node-feature-discovery
+      chart-path: "charts-to-test/node-feature-discovery"
+      exclude-chart-files: '["Chart.yaml", "new-file-to-exclude"]'
       ref-name: ${{ inputs.ref_name }}
       ref-type: ${{ inputs.ref_type }}
       network-operator-repo: reusable-release-workflows-testing
@@ -113,12 +116,40 @@ jobs:
           DOCKER_TAG: ${{ needs.call-reusable-ci-fork-workflow.outputs.docker-tag }}
           # TODO make react on public and internal registries if needed
           DOCKER_REGISTRY: ghcr.io/almaslennikov
+          RELEASE_FILE: hack/release.yaml
         run: |
-          make release-build
+          make check-release-build
+
+          echo "Validating changes in release.yaml..."
+
+          OPERATOR_VERSION=$(yq '.nicConfigurationOperator.version' $RELEASE_FILE)
+          DAEMON_VERSION=$(yq '.nicConfigurationConfigDaemon.version' $RELEASE_FILE)
+          OPERATOR_REPO=$(yq '.nicConfigurationOperator.repository' $RELEASE_FILE)
+          DAEMON_REPO=$(yq '.nicConfigurationConfigDaemon.repository' $RELEASE_FILE)
+
+          echo "Found operator version $OPERATOR_VERSION and repo $OPERATOR_REPO, daemon version $DAEMON_VERSION and repo $DAEMON_REPO"
+
+          if [ "$OPERATOR_VERSION" != "$DOCKER_TAG" ]; then \
+              echo "Error: NicConfigurationOperator version is not set correctly in $RELEASE_FILE"; exit 1; \
+          fi
+
+          if [ "$DAEMON_VERSION" != "$DOCKER_TAG" ]; then \
+              echo "Error: NicConfigurationConfigDaemon version is not set correctly in $RELEASE_FILE"; exit 1; \
+          fi
+
+          if [ "$OPERATOR_REPO" != "$DOCKER_REGISTRY" ]; then \
+              echo "Error: NicConfigurationOperator repository is not set correctly in $RELEASE_FILE"; exit 1; \
+          fi
+
+          if [ "$DAEMON_REPO" != "$DOCKER_REGISTRY" ]; then \
+              echo "Error: NicConfigurationConfigDaemon repository is not set correctly in $RELEASE_FILE"; exit 1; \
+          fi
 
           # TODO validate that the docker image was built from the requested branch
 
-          PATH_TO_CHART="deployment/network-operator/charts/test-chart"
+          echo "Validating changes in the helm chart..."
+
+          PATH_TO_CHART="deployment/network-operator/charts/node-feature-discovery"
 
           ls $PATH_TO_CHART
 
@@ -132,12 +163,12 @@ jobs:
             exit 1
           fi
 
-          if ! grep -Fxq "old content" $PATH_TO_CHART/existing-file-to-exclude; then
+          if grep -Fxq "new content" $PATH_TO_CHART/Chart.yaml; then
             echo "Error: existing-file-to-exclude should not have been updated in the network-operator" >&2
             exit 1
           fi
 
-          if ! grep -Fxq "new content" $PATH_TO_CHART/folder/existing-file-to-change; then
+          if ! grep -Fxq "new content" $PATH_TO_CHART/crds/nfd-api-crds.yaml; then
             echo "Error: existing-file-to-change should have been updated in the network-operator" >&2
             exit 1
           fi
